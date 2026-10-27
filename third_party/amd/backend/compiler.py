@@ -49,6 +49,8 @@ class _AMDGPUCodegenOptions(ctypes.Structure):
         ("canonicalize_gep", ctypes.c_uint8),
         ("dump_ir", ctypes.c_uint8),
         ("enable_timing", ctypes.c_uint8),
+        ("enable_misched", ctypes.c_uint8),
+        ("emit_object", ctypes.c_uint8),
     ]
 
 
@@ -97,7 +99,7 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
     # longer honor TargetOptions::AllowFPOpFusion during code generation.
     llvm_ir = llvm.to_bitcode(src, enable_fp_fusion, legacy_alias_scopes=True)
     options = _AMDGPUCodegenOptions(
-        1,
+        2,
         triple.encode("utf-8"),
         processor.encode("utf-8"),
         features.encode("utf-8"),
@@ -109,6 +111,8 @@ def compile_amdgpu(src: str, triple: str, processor: str, features: str, *, flag
         canonicalize_gep,
         dump_ir,
         enable_timing,
+        0,
+        0,
     )
     assembly = ctypes.c_void_p()
     assembly_size = ctypes.c_size_t()
@@ -266,8 +270,7 @@ class HIPOptions:
     # LLVM IR. It interleaves the MFMAs of each hot loop with the memory operations that are
     # independent of them, keeping the matrix unit busy, and pins that order with
     # llvm.amdgcn.sched.barrier so LLVM's machine schedulers preserve it. Kernels without an
-    # eligible loop are left untouched. MFMA accumulators pinned with `cd_regclass` keep their
-    # pins next to the moved MFMAs.
+    # eligible loop are left untouched. The `cd_regclass` constraint stays on each moved MFMA.
     schedule_hint: str = ''
 
     # Experimental: intended for development and debugging; may change or be removed without notice.

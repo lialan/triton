@@ -2758,12 +2758,16 @@ def test_amd_wmma(M, N, K, in_dtype, wide_k_width):
     torch.testing.assert_close(ref, triton_output)
 
 
-def _check_cd_regclass_pins(llir, cd_regclass):
-    """Check that the LLVM IR pins MFMA accumulators to `cd_regclass`, or has no pins when it is None."""
-    if cd_regclass is None:
-        assert '"=a,0"' not in llir and '"=v,0"' not in llir
-    else:
-        assert f'"={cd_regclass},0"' in llir
+def _check_cd_regclass_policy(llir, cd_regclass):
+    """Every MFMA carries the policy, including intermediate K steps."""
+    assert '"=a,0"' not in llir and '"=v,0"' not in llir
+    calls = [line for line in llir.splitlines() if 'call ' in line and '@llvm.amdgcn.mfma.' in line]
+    assert calls
+    policy = {None: "auto", "a": "agpr", "v": "vgpr"}[cd_regclass]
+    groups = dict(re.findall(r"attributes #([0-9]+) = \{([^\n]*)\}", llir))
+    for call in calls:
+        group = re.search(r"\) #([0-9]+)", call)
+        assert group and f"cd_regclass({policy})" in groups[group[1]], call
 
 
 @pytest.mark.skipif(not (is_hip_cdna3() or is_hip_cdna4()), reason="Requires CDNA3 or CDNA4")
@@ -2845,7 +2849,7 @@ def _run_amd_mfma(M, N, K, in_dtype, num_warps, cdna_version, cd_regclass):
     ref = torch.matmul(a, b)
     triton_output = c
     torch.testing.assert_close(ref, triton_output)
-    _check_cd_regclass_pins(compiled.asm["llir"], cd_regclass)
+    _check_cd_regclass_policy(compiled.asm["llir"], cd_regclass)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
@@ -2952,7 +2956,7 @@ def test_amd_mfma_scaled(M, N, K, a_type, b_type, cd_regclass, has_scale, device
         torch.testing.assert_close(out, out_ref)
 
     assert 'v_mfma_scale_f32_16x16x128_f8f6f4' in compiled.asm['amdgcn']
-    _check_cd_regclass_pins(compiled.asm['llir'], cd_regclass)
+    _check_cd_regclass_policy(compiled.asm['llir'], cd_regclass)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")

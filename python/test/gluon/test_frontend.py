@@ -4,6 +4,7 @@ import pytest
 import re
 from dataclasses import replace
 
+import triton
 from triton.backends.compiler import GPUTarget
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
@@ -4043,10 +4044,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4])
-def test_amd_mfma_cd_regclass(target):
+@pytest.mark.parametrize("cd_regclass", [None, "a", "v", "invalid"])
+def test_amd_mfma_cd_regclass(target, cd_regclass):
 
     @gluon.jit
-    def kernel():
+    def kernel(CD_REGCLASS: ttgl.constexpr):
         mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=3, warps_per_cta=[4, 1], instr_shape=[32, 32, 8],
                                                              transposed=True)
 
@@ -4056,10 +4058,17 @@ def test_amd_mfma_cd_regclass(target):
                                                                                 k_width=8))
 
         acc = ttgl.full([64, 64], 0.0, ttgl.float32, layout=mfma_layout)
-        ttgl.amd.cdna3.mfma(a, b, acc, cd_regclass="a")
+        ttgl.amd.cdna3.mfma(a, b, acc, cd_regclass=CD_REGCLASS)
 
-    module_text = run_parser(kernel, target=target).str_nodebug()
-    assert re.search(r'tt\.dot .*\{amdg\.cd_regclass = "a"\}', module_text)
+    if cd_regclass == "invalid":
+        with pytest.raises(CompilationError, match="cd_regclass must be None, 'a' or 'v'"):
+            run_parser(kernel, args=(cd_regclass, ), target=target)
+        return
+    module_text = run_parser(kernel, args=(cd_regclass, ), target=target).str_nodebug()
+    if cd_regclass is None:
+        assert "amdg.cd_regclass" not in module_text
+    else:
+        assert re.search(rf'tt\.dot .*\{{amdg\.cd_regclass = "{cd_regclass}"\}}', module_text)
 
 
 @gluon.jit
@@ -4132,10 +4141,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
-def test_amd_mfma_scaled_cd_regclass(target):
+@pytest.mark.parametrize("cd_regclass", [None, "a", "v", "invalid"])
+def test_amd_mfma_scaled_cd_regclass(target, cd_regclass):
 
     @gluon.jit
-    def kernel():
+    def kernel(CD_REGCLASS: ttgl.constexpr):
         mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128], transposed=True,
                                                              warps_per_cta=[1, 1])
         a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
@@ -4144,10 +4154,97 @@ def test_amd_mfma_scaled_cd_regclass(target):
         a = ttgl.full([16, 64], 0x11, ttgl.uint8, a_layout)
         b = ttgl.full([64, 16], 0x22, ttgl.uint8, b_layout)
         acc = ttgl.full([16, 16], 0, ttgl.float32, mfma_layout)
-        ttgl.amd.cdna4.mfma_scaled(a, None, 'e2m1', b, None, 'e2m1', acc, cd_regclass="v")
+        ttgl.amd.cdna4.mfma_scaled(a, None, 'e2m1', b, None, 'e2m1', acc, cd_regclass=CD_REGCLASS)
 
-    module_text = run_parser(kernel, *make_args(num_warps=1), target=target).str_nodebug()
-    assert re.search(r'tt\.dot_scaled .*amdg\.cd_regclass = "v"', module_text)
+    if cd_regclass == "invalid":
+        with pytest.raises(CompilationError, match="cd_regclass must be None, 'a' or 'v'"):
+            run_parser(kernel, *make_args(cd_regclass, num_warps=1), target=target)
+        return
+    module_text = run_parser(kernel, *make_args(cd_regclass, num_warps=1), target=target).str_nodebug()
+    if cd_regclass is None:
+        assert "amdg.cd_regclass" not in module_text
+    else:
+        assert re.search(rf'tt\.dot_scaled .*amdg\.cd_regclass = "{cd_regclass}"', module_text)
+
+
+def _check_amd_mfma_cd_regclass_codegen(compiled, cd_regclass):
+    llir = compiled.asm["llir"]
+    assert '"=a,0"' not in llir and '"=v,0"' not in llir
+    calls = [line for line in llir.splitlines() if "call " in line and "@llvm.amdgcn.mfma." in line]
+    policy = {None: "auto", "a": "agpr", "v": "vgpr"}[cd_regclass]
+    groups = dict(re.findall(r"attributes #([0-9]+) = \{([^\n]*)\}", llir))
+    assert calls
+    for call in calls:
+        group = re.search(r"\) #([0-9]+)", call)
+        assert group and f"cd_regclass({policy})" in groups[group[1]], call
+    mfmas = [line for line in compiled.asm["amdgcn"].splitlines() if re.match(r"\s*v_mfma_", line)]
+    assert mfmas
+    if cd_regclass is not None:
+        # Inspect the MFMA's physical operands, not transfers around it.
+        for line in mfmas:
+            operands = line.split(None, 1)[1].split(",")
+            assert operands[0].strip().startswith(cd_regclass + "["), line
+            assert operands[3].strip().startswith(cd_regclass + "["), line
+    assert compiled.asm["hsaco"]
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4])
+@pytest.mark.parametrize("cd_regclass", [None, "a", "v"])
+def test_amd_mfma_cd_regclass_codegen(target, cd_regclass):
+    @gluon.jit
+    def kernel(C, D, CD_REGCLASS: ttgl.constexpr, VERSION: ttgl.constexpr):
+        k: ttgl.constexpr = 16 if VERSION == 3 else 32
+        width: ttgl.constexpr = 4 if VERSION == 3 else 8
+        layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=VERSION, instr_shape=[16, 16, k],
+                                                         transposed=True, warps_per_cta=[2, 2])
+        a = ttgl.full([32, 64], 0.5, ttgl.float16, ttgl.DotOperandLayout(0, layout, width))
+        b = ttgl.full([64, 32], 0.25, ttgl.float16, ttgl.DotOperandLayout(1, layout, width))
+        rows = ttgl.arange(0, 32, layout=ttgl.SliceLayout(1, layout))
+        cols = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, layout))
+        offsets = rows[:, None] * 32 + cols[None, :]
+        acc = ttgl.load(C + offsets)
+        result = ttgl.amd.cdna3.mfma(a, b, acc, cd_regclass=CD_REGCLASS)
+        ttgl.store(D + offsets, result)
+
+    source = gluon.GluonASTSource(
+        kernel, {"C": "*fp32", "D": "*fp32", "CD_REGCLASS": "constexpr", "VERSION": "constexpr"},
+        {"CD_REGCLASS": cd_regclass, "VERSION": 3 if target == HIP_TARGET_CDNA3 else 4})
+    compiled = triton.compile(source, target=target, options={"num_warps": 4})
+    _check_amd_mfma_cd_regclass_codegen(compiled, cd_regclass)
+
+
+@pytest.mark.parametrize("cd_regclass", [None, "a", "v"])
+@pytest.mark.parametrize("scale", [None, 0, 127])
+def test_amd_mfma_scaled_cd_regclass_codegen(cd_regclass, scale):
+    @gluon.jit
+    def kernel(C, D, CD_REGCLASS: ttgl.constexpr, SCALE: ttgl.constexpr):
+        layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16, 128],
+                                                         transposed=True, warps_per_cta=[2, 2])
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(0, layout, 16)
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, layout, 16)
+        a = ttgl.full([32, 256], 0x11, ttgl.uint8, a_layout)
+        b = ttgl.full([256, 32], 0x22, ttgl.uint8, b_layout)
+        a_scale = None
+        b_scale = None
+        if SCALE is not None:
+            a_scale = ttgl.full([32, 8], SCALE, ttgl.uint8, ttgl.amd.cdna4.get_mfma_scale_layout(a_layout, [32, 8]))
+            b_scale = ttgl.full([32, 8], SCALE, ttgl.uint8, ttgl.amd.cdna4.get_mfma_scale_layout(b_layout, [32, 8]))
+        rows = ttgl.arange(0, 32, layout=ttgl.SliceLayout(1, layout))
+        cols = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, layout))
+        offsets = rows[:, None] * 32 + cols[None, :]
+        acc = ttgl.load(C + offsets)
+        result = ttgl.amd.cdna4.mfma_scaled(a, a_scale, 'e4m3', b, b_scale, 'e4m3', acc, cd_regclass=CD_REGCLASS)
+        ttgl.store(D + offsets, result)
+
+    source = gluon.GluonASTSource(
+        kernel, {"C": "*fp32", "D": "*fp32", "CD_REGCLASS": "constexpr", "SCALE": "constexpr"},
+        {"CD_REGCLASS": cd_regclass, "SCALE": scale})
+    compiled = triton.compile(source, target=HIP_TARGET_CDNA4, options={"num_warps": 4})
+    _check_amd_mfma_cd_regclass_codegen(compiled, cd_regclass)
+    # Omitted Gluon scales are materialized as unit E8M0 values (127).
+    # Explicit zero scale operands exercise LLVM's unscaled-form fold.
+    mnemonic = "v_mfma_f32_" if scale == 0 else "v_mfma_scale_f32_"
+    assert mnemonic in compiled.asm["amdgcn"]
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])

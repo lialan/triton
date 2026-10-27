@@ -83,8 +83,8 @@ struct DotOpMFMAConversionHelper {
         typeConverter(typeConverter), loc(loc), ctx(mfmaLayout.getContext()) {}
 
   Value generateMFMAOp(StringRef intrinsicName, Value valA, Value valB,
-                       Value valC, int cbsz = 0, int abid = 0,
-                       int blgp = 0) const {
+                       Value valC, ROCDL::MFMACDRegClass cdRegClass,
+                       int cbsz = 0, int abid = 0, int blgp = 0) const {
     assert(cbsz >= 0 && cbsz <= 4);
     assert(abid >= 0 && abid <= 15);
     assert(blgp >= 0 && blgp <= 7);
@@ -95,6 +95,8 @@ struct DotOpMFMAConversionHelper {
     loweredOp.addOperands({valA, valB, valC});
     loweredOp.addAttribute("cbsz", rewriter.getI32IntegerAttr(cbsz));
     loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(abid));
+    loweredOp.addAttribute("cd_regclass",
+                           ROCDL::MFMACDRegClassAttr::get(ctx, cdRegClass));
     // For `blgp`: f64 MFMA uses negation flags, while other MFMA ops use B-lane
     // permutation flags.
     auto vecTy = cast<VectorType>(resType);
@@ -114,20 +116,12 @@ struct DotOpMFMAConversionHelper {
   // `mfma` / `mfma_scaled`.
   static constexpr llvm::StringLiteral kCDRegClassAttrName = "amdg.cd_regclass";
 
-  // Register classes to pin an MFMA tile's accumulator input (C) and result
-  // (D) to: "a" = AGPRs, "v" = VGPRs, empty = no pin.
-  struct CDPins {
-    StringRef c;
-    StringRef d;
-  };
-
-  // The pins requested by `kCDRegClassAttrName` on `op`, whose accumulator
-  // input is `c`. A constant accumulator (e.g. zeros) is not pinned on C:
-  // LLVM folds it into the MFMA as an immediate, which a pin would prevent.
-  static FailureOr<CDPins> getCDPins(Operation *op, Value c) {
+  // Constrain each MFMA, including every K step. A legal immediate C remains
+  // foldable: the policy constrains register-valued C and D at the instruction.
+  static FailureOr<ROCDL::MFMACDRegClass> getCDRegClass(Operation *op) {
     Attribute attr = op->getAttr(kCDRegClassAttrName);
     if (!attr)
-      return CDPins{};
+      return ROCDL::MFMACDRegClass::Auto;
     auto regClass = dyn_cast<StringAttr>(attr);
     if (!regClass ||
         (regClass.getValue() != "a" && regClass.getValue() != "v")) {
@@ -135,27 +129,8 @@ struct DotOpMFMAConversionHelper {
                       << attr;
       return failure();
     }
-    StringRef cls = regClass.getValue();
-    return CDPins{matchPattern(c, m_Constant()) ? StringRef() : cls, cls};
-  }
-
-  // Wraps `acc` in an empty inline asm whose output is tied to its input
-  // (constraint "=<regClass>,0"). No instruction is emitted, but the value has
-  // to sit in the given register class ("a" = AGPRs, "v" = VGPRs) at this
-  // point, which steers the MFMA accumulator into that register file. Returns
-  // `acc` unchanged when `regClass` is empty.
-  Value pinRegClass(Value acc, StringRef regClass) const {
-    if (regClass.empty())
-      return acc;
-    std::string constraints = ("=" + regClass + ",0").str();
-    return LLVM::InlineAsmOp::create(
-               rewriter, loc, acc.getType(), ValueRange{acc},
-               /*asm_string=*/"", constraints, /*has_side_effects=*/false,
-               /*is_align_stack=*/false, LLVM::TailCallKind::None,
-               /*convergent=*/false,
-               LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
-               /*operand_attrs=*/ArrayAttr())
-        ->getResult(0);
+    return regClass.getValue() == "a" ? ROCDL::MFMACDRegClass::RequireAGPR
+                                      : ROCDL::MFMACDRegClass::RequireVGPR;
   }
 
   int getNumSubmatrices(Type elementType, int mDim, int nDim) const {
@@ -307,8 +282,8 @@ struct DotOpMFMAConversionHelper {
     auto kDim = mnkDim[2];
     auto mfmaVersion = mfmaLayout.getVersion();
 
-    FailureOr<CDPins> cdPins = getCDPins(op.getOperation(), op.getC());
-    if (failed(cdPins))
+    auto cdRegClass = getCDRegClass(op.getOperation());
+    if (failed(cdRegClass))
       return failure();
 
     Value a = op.getA();
@@ -413,9 +388,6 @@ struct DotOpMFMAConversionHelper {
             Value c = fc[linearIdx];
             acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
           }
-          // Pin C right before the tile's first MFMA.
-          acc = pinRegClass(acc, cdPins->c);
-
           for (int k = 0; k < numVecInKBase; ++k) {
             Value op1 = operandA[{b, m, k}];
             Value op2 = operandB[{b, n, k}];
@@ -440,14 +412,12 @@ struct DotOpMFMAConversionHelper {
             if (mfmaLayout.getIsTransposed())
               std::swap(op1, op2);
 
-            acc = generateMFMAOp(intrinsicName, op1, op2, acc, cbsz, abid);
+            acc = generateMFMAOp(intrinsicName, op1, op2, acc, *cdRegClass,
+                                 cbsz, abid);
 
             if (!firstMfma)
               firstMfma = acc;
           }
-          // Pin D right after the tile's last MFMA.
-          acc = pinRegClass(acc, cdPins->d);
-
           adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
                                 kDimInstrSize, kDimOperandSize, elemsPerVec);
         }
@@ -609,7 +579,8 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
       : DotOpMFMAConversionHelper(mfmaLayout, rewriter, typeConverter, loc) {}
 
   Value generateScaledMFMAOp(StringRef intrinsicName, Value valA, Value valB,
-                             Value valC, Type elemTypeA, Type elemTypeB) const {
+                             Value valC, Type elemTypeA, Type elemTypeB,
+                             ROCDL::MFMACDRegClass cdRegClass) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto resType = valC.getType();
     OperationState loweredOp(loc, intrinsicName);
@@ -625,13 +596,16 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     loweredOp.addAttribute("blgp", ROCDL::MatrixFormatAttr::get(ctx, *blgp));
     loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(0));
     loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(0));
+    loweredOp.addAttribute("cd_regclass",
+                           ROCDL::MFMACDRegClassAttr::get(ctx, cdRegClass));
     return rewriter.create(loweredOp)->getResult(0);
   }
 
   Value generateScaledMFMAOp(StringRef intrinsicName, Value valA, Value valB,
                              Value valC, Value valScaleA, Value valScaleB,
                              Type elemTypeA, Type elemTypeB, int opSelA,
-                             int opSelB) const {
+                             int opSelB,
+                             ROCDL::MFMACDRegClass cdRegClass) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto resType = valC.getType();
     OperationState loweredOp(loc, intrinsicName);
@@ -644,6 +618,8 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     loweredOp.addAttribute("blgp", ROCDL::MatrixFormatAttr::get(ctx, *blgp));
     loweredOp.addAttribute("opselA", rewriter.getI32IntegerAttr(opSelA));
     loweredOp.addAttribute("opselB", rewriter.getI32IntegerAttr(opSelB));
+    loweredOp.addAttribute("cd_regclass",
+                           ROCDL::MFMACDRegClassAttr::get(ctx, cdRegClass));
     return rewriter.create(loweredOp)->getResult(0);
   }
 
@@ -662,8 +638,8 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     Value b = op.getB();
     Value aScale = op.getAScale();
     Value bScale = op.getBScale();
-    FailureOr<CDPins> cdPins = getCDPins(op.getOperation(), op.getC());
-    if (failed(cdPins))
+    auto cdRegClass = getCDRegClass(op.getOperation());
+    if (failed(cdRegClass))
       return failure();
     if ((aScale && !bScale) || (!aScale && bScale)) {
       llvm::report_fatal_error("Single scale is not supported\n");
@@ -845,10 +821,6 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
                   tb.i32_val(v));
             }
             acc = zeroAuxiliarBlocks(subBlocks, acc);
-            // Pin C right before this pass's MFMAs (all K steps, or one K step
-            // with pingpong_2step). Only the first pass reads the op's C; later
-            // passes read the previous pass's result.
-            acc = pinRegClass(acc, outerK == 0 ? cdPins->c : cdPins->d);
             for (innerK = 0; innerK < innerKBound; innerK++) {
               int k = is2Step ? outerK : innerK;
               if (existBothScales) {
@@ -867,33 +839,33 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
                       acc, operandBScale[{b, nScale, bkScale}],
                       operandAScale[{b, mScale, akScale}],
                       maybeMfmaIntrinsic->bElementType,
-                      maybeMfmaIntrinsic->aElementType, opSelB, opSelA);
+                      maybeMfmaIntrinsic->aElementType, opSelB, opSelA,
+                      *cdRegClass);
                 } else {
                   acc = generateScaledMFMAOp(
                       intrinsicName, operandA[{b, m, k}], operandB[{b, n, k}],
                       acc, operandAScale[{b, mScale, akScale}],
                       operandBScale[{b, nScale, bkScale}],
                       maybeMfmaIntrinsic->aElementType,
-                      maybeMfmaIntrinsic->bElementType, opSelA, opSelB);
+                      maybeMfmaIntrinsic->bElementType, opSelA, opSelB,
+                      *cdRegClass);
                 }
               } else {
                 if (mfmaLayout.getIsTransposed()) {
-                  acc = generateScaledMFMAOp(intrinsicName, operandB[{b, n, k}],
-                                             operandA[{b, m, k}], acc,
-                                             maybeMfmaIntrinsic->bElementType,
-                                             maybeMfmaIntrinsic->aElementType);
+                  acc = generateScaledMFMAOp(
+                      intrinsicName, operandB[{b, n, k}], operandA[{b, m, k}],
+                      acc, maybeMfmaIntrinsic->bElementType,
+                      maybeMfmaIntrinsic->aElementType, *cdRegClass);
                 } else {
-                  acc = generateScaledMFMAOp(intrinsicName, operandA[{b, m, k}],
-                                             operandB[{b, n, k}], acc,
-                                             maybeMfmaIntrinsic->aElementType,
-                                             maybeMfmaIntrinsic->bElementType);
+                  acc = generateScaledMFMAOp(
+                      intrinsicName, operandA[{b, m, k}], operandB[{b, n, k}],
+                      acc, maybeMfmaIntrinsic->aElementType,
+                      maybeMfmaIntrinsic->bElementType, *cdRegClass);
                 }
               }
               if (!firstMfma)
                 firstMfma = acc;
             }
-            // Pin D right after this pass's MFMAs.
-            acc = pinRegClass(acc, cdPins->d);
             acc = reduceSubBlocks(subBlocks, acc);
             adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
                                   kDimInstrSize, kDimOperandSize, elemsPerVec);

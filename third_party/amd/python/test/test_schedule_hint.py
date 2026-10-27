@@ -6,6 +6,7 @@ scheduler interleaves. Everything is compiled for gfx950 without launching, and
 the assertions are on the LLVM IR and the assembly.
 """
 
+import re
 import pytest
 import triton
 from triton.backends.compiler import GPUTarget
@@ -181,8 +182,21 @@ def _compile_scale(target=GFX950, **options):
 
 
 SCHED_BARRIER = "llvm.amdgcn.sched.barrier"
-ACC_PIN = '"=a,0"'
 
+
+def _mfma_policies(llir):
+    calls = [line for line in llir.splitlines() if "call " in line and "@llvm.amdgcn.mfma." in line]
+    assert calls
+    assert '"=a,0"' not in llir and '"=v,0"' not in llir
+    groups = dict(re.findall(r"attributes #([0-9]+) = \{([^\n]*)\}", llir))
+    policies = []
+    for call in calls:
+        group = re.search(r"\) #([0-9]+)", call)
+        assert group, call
+        policy = re.search(r"cd_regclass\((auto|agpr|vgpr)\)", groups[group[1]])
+        assert policy, call
+        policies.append(policy[1])
+    return policies
 
 def test_scheduler_off_by_default():
     k = _compile_gemm()
@@ -205,15 +219,17 @@ def test_interleave_schedules_the_hot_loop():
     assert "v_mfma" in amdgcn
 
 
-def test_interleave_keeps_accumulator_pins():
-    # cd_regclass="a" pins every MFMA's C and D with an empty tied inline asm. The scheduler moves
-    # the pins with their MFMAs, so all of them survive into the scheduled IR.
+def test_interleave_keeps_cd_regclass_policy():
     unscheduled = _compile_gemm(pin_acc=True)
     scheduled = _compile_gemm(pin_acc=True, schedule_hint="mfma-schedule")
     assert SCHED_BARRIER in scheduled.asm["llir"]
-    pins = unscheduled.asm["llir"].count(ACC_PIN)
-    assert pins > 0
-    assert scheduled.asm["llir"].count(ACC_PIN) == pins
+    before = _mfma_policies(unscheduled.asm["llir"])
+    after = _mfma_policies(scheduled.asm["llir"])
+    assert before and all(policy == "agpr" for policy in before)
+    assert after == before
+    # Register policy itself needs no scheduler fences.
+    automatic = _compile_gemm(schedule_hint="mfma-schedule")
+    assert scheduled.asm["llir"].count(SCHED_BARRIER) == automatic.asm["llir"].count(SCHED_BARRIER)
 
 
 def test_pre_barriered_loop_is_scheduled_span_by_span():

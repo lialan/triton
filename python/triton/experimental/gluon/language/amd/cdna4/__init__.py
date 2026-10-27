@@ -53,7 +53,9 @@ def mfma_scaled(a, a_scale, a_format, b, b_scale, b_format, acc, cd_regclass=Non
         acc (tensor): Accumulator tensor.
         cd_regclass (str, optional): Experimental. Register class for the accumulator input (C)
             and result (D) of the scaled MFMA instructions, as for ``mfma``: ``"a"`` for AGPRs or
-            ``"v"`` for VGPRs. ``None`` (default) leaves the choice to the compiler.
+            ``"v"`` for VGPRs. ``None`` (default) leaves the choice to the compiler. Explicit
+            settings require the native form on every instruction, including zero-scale
+            folds to unscaled MFMA, rather than only constraining tile-boundary values.
     """
     layout = acc.type.layout
     assert isinstance(layout, AMDMFMALayout), "Expected layout to be an instance of AMDMFMALayout"

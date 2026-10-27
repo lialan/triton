@@ -17,9 +17,8 @@
 // already carries sched.barriers (an explicit hint, or a block-pingpong
 // cluster boundary) is scheduled range by range between them.
 //
-// MFMA accumulators pinned to a register class by Gluon's cd_regclass (an
-// empty tied inline asm on C and D) travel with their MFMA and are fenced, so
-// the pins survive register allocation.
+// Gluon's cd_regclass is an attribute on the MFMA call. Moving the call keeps
+// the constraint attached without extra scheduling instructions or fences.
 //
 // Every block is scheduled transactionally: snapshot, schedule, verify, and
 // roll the block back if the result is invalid, so a bad schedule never
@@ -39,7 +38,6 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/Verifier.h"
@@ -128,45 +126,6 @@ bool isHoistTransparentInst(const Instruction &I) {
 
 bool isSinkTransparentInst(const Instruction &I) {
   return isa<ExtractElementInst>(I);
-}
-
-// A register-class pin: an empty inline asm whose output is tied to its input
-// ("=a,0" / "=v,0"), which Triton's `cd_regclass` MFMA lowering puts around
-// each MFMA tile's accumulator. It emits no instruction; it only forces the
-// value into AGPRs or VGPRs at that point, so it has to stay right next to its
-// MFMA: the pin on C directly before the MFMA, the pin on D directly after.
-bool isRegClassPin(const Instruction &I) {
-  const auto *CI = dyn_cast<CallInst>(&I);
-  if (!CI || CI->arg_size() != 1 ||
-      CI->getType() != CI->getArgOperand(0)->getType())
-    return false;
-  const auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand());
-  if (!IA || !IA->getAsmString().empty())
-    return false;
-  StringRef Constraints = IA->getConstraintString();
-  return Constraints == "=a,0" || Constraints == "=v,0";
-}
-
-// The pin that produces MFMA's accumulator operand C, if that is its only use.
-Instruction *getCPin(Instruction *MFMA) {
-  auto *CI = cast<CallInst>(MFMA);
-  if (CI->arg_size() < 3 || CI->getArgOperand(2)->getType() != CI->getType())
-    return nullptr;
-  auto *Pin = dyn_cast<Instruction>(CI->getArgOperand(2));
-  if (!Pin || !isRegClassPin(*Pin) || !Pin->hasOneUse() ||
-      Pin->getParent() != MFMA->getParent())
-    return nullptr;
-  return Pin;
-}
-
-// The pin on MFMA's result D, if it is the result's only user.
-Instruction *getDPin(Instruction *MFMA) {
-  if (!MFMA->hasOneUse())
-    return nullptr;
-  auto *Pin = dyn_cast<Instruction>(*MFMA->user_begin());
-  if (!Pin || !isRegClassPin(*Pin) || Pin->getParent() != MFMA->getParent())
-    return nullptr;
-  return Pin;
 }
 
 SchedKind classifySchedInst(const Instruction &I) {
@@ -361,7 +320,7 @@ private:
     });
   }
 
-  // Does I reach an MFMA through prep instructions and pins only?
+  // Does I reach an MFMA through prep instructions only?
   static bool feedsMFMA(Instruction *I) {
     SmallVector<Value *, 8> Worklist{I};
     SmallPtrSet<Value *, 16> Visited;
@@ -373,7 +332,7 @@ private:
         if (auto *UI = dyn_cast<Instruction>(U)) {
           if (isMFMAorWMMA(*UI))
             return true;
-          if (isHoistTransparentInst(*UI) || isRegClassPin(*UI))
+          if (isHoistTransparentInst(*UI))
             Worklist.push_back(UI);
         }
       }
@@ -381,7 +340,7 @@ private:
     return false;
   }
 
-  // Does I come from an MFMA through extracts and pins only?
+  // Does I come from an MFMA through extracts only?
   static bool definedByMFMA(Instruction *I) {
     SmallVector<Value *, 8> Worklist{I};
     SmallPtrSet<Value *, 16> Visited;
@@ -392,7 +351,7 @@ private:
       if (auto *DefI = dyn_cast<Instruction>(V)) {
         if (isMFMAorWMMA(*DefI))
           return true;
-        if (isSinkTransparentInst(*DefI) || isRegClassPin(*DefI))
+        if (isSinkTransparentInst(*DefI))
           for (Value *Op : DefI->operands())
             Worklist.push_back(Op);
       }
@@ -448,27 +407,17 @@ private:
   // scheduleSpans skips such a span anyway.
   static SpanContents preprocessSpan(const Span &R) {
     SpanContents Res = collectSpan(R);
-    Instruction *HoistPos = R.Begin;
-    if (Instruction *DPin = getDPin(R.Begin))
-      HoistPos = DPin; // keep the span start's D pin directly after it
     for (Instruction *I : llvm::reverse(Res.Hoist))
-      I->moveAfter(HoistPos);
+      I->moveAfter(R.Begin);
     if (Res.LastAnchor)
       for (Instruction *I : llvm::reverse(Res.Sink))
         I->moveAfter(Res.LastAnchor);
     return Res;
   }
 
-  // Move one MFMA right after InsertPt, together with its register-class pins:
-  // the C pin stays directly before it and the D pin directly after it.
+  // The register-class attribute travels with the call.
   static void moveMFMAAfter(Instruction *MFMA, Instruction *InsertPt) {
-    Instruction *CPin = getCPin(MFMA);
-    Instruction *DPin = getDPin(MFMA);
     MFMA->moveAfter(InsertPt);
-    if (CPin)
-      CPin->moveBefore(MFMA->getIterator());
-    if (DPin)
-      DPin->moveAfter(MFMA);
   }
 
   // Move up to Count MFMAs, taken from the back of MFMAInsts[0, MFMAIdx), to
@@ -569,16 +518,10 @@ private:
                               LDSBytesPerClk);
 
       // Pin the interleave. A fence in front of each anchor makes every window
-      // between fences `anchor, mfma...`, with the memory op leading; a fence
-      // after each D pin keeps the machine scheduler from reordering pinned
-      // MFMAs between anchors, which would leave the pins behind as
-      // v_accvgpr copies. Machine scheduling stays enabled everywhere else.
+      // between fences `anchor, mfma...`, with the memory op leading.
       for (const AnchorInst &A : Res.Anchors)
         if (Instruction *Prev = A.I->getPrevNode())
           insertSchedBarrier(Prev);
-      for (Instruction *MFMA : Res.MFMAInsts)
-        if (Instruction *DPin = getDPin(MFMA))
-          insertSchedBarrier(DPin);
       ++Scheduled;
     }
     return Scheduled > 0;

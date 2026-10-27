@@ -201,7 +201,10 @@ def mfma(a, b, acc, cd_regclass=None, _semantic: GluonSemantic = None):
         cd_regclass (str, optional): Experimental. Register class for the accumulator input (C)
             and result (D) of the MFMA instructions: ``"a"`` for AGPRs or ``"v"`` for VGPRs.
             Requires an ``AMDMFMALayout`` accumulator. ``None`` (default) leaves the choice to
-            the compiler.
+            the compiler. An explicit setting requires the native C/D form on every MFMA,
+            including intermediate K steps. Legal immediate C operands remain foldable;
+            other uses of the result may require real register transfers. Unsupported forms
+            are diagnosed (in particular, VGPR C/D requires CDNA2 or later).
     """
     assert acc is not None, "acc is required"
     ret_type = acc.type
